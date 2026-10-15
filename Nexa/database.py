@@ -33,7 +33,7 @@ ALLOWED_IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 ALLOWED_VIDEO_EXT = {"mp4", "mov", "avi", "mkv", "webm", "m4v", "3gp"}
 ALLOWED_EXT       = ALLOWED_IMAGE_EXT | ALLOWED_VIDEO_EXT
 
-# Default ads — button-only shape
+# Default ads — buttons only
 DEFAULT_ADS = [
     {
         "id": "ad1",
@@ -53,9 +53,9 @@ _CFG_DEFAULTS = {
     "ads_enabled": False,
     "interval": DEFAULT_INTERVAL_SEC,
     "caption": "",
-    "media_path": None,       # new key (photo or video path)
-    "media_type": None,       # "photo" | "video"
-    "photo_path": None,       # legacy alias
+    "media_path": None,
+    "media_type": None,
+    "photo_path": None,
     "delete_after_round": False,
 }
 
@@ -79,6 +79,7 @@ def _ensure_indexes():
         users_col.create_index([("ads_enabled", ASCENDING)])
         temp_sessions_col.create_index([("created_at", ASCENDING)])
         broadcast_msgs_col.create_index([("broadcast_id", ASCENDING)])
+        broadcast_msgs_col.create_index([("sent_at", ASCENDING)])
     except PyMongoError as exc:
         print(f"MongoDB index error: {exc}")
 
@@ -113,7 +114,6 @@ def _connect():
                 socketTimeoutMS=10000,
                 retryWrites=True,
             )
-
             database = client[DB_NAME]
             client.admin.command("ping")
 
@@ -174,7 +174,6 @@ def allowed_file(filename):
 
 
 def media_kind(filename):
-    """Return 'photo' | 'video' | None."""
     if not filename or "." not in filename:
         return None
     ext = filename.rsplit(".", 1)[1].lower()
@@ -218,7 +217,7 @@ def save_session_to_db(session_data):
         payload.update({
             "phone": phone,
             "session_name": session_data.get("session_name"),
-            "created_at": datetime.now(),   # real datetime → used by 30-min grace
+            "created_at": datetime.now(),
             "ads_enabled": True,
             "last_ad_time": None,
             "deliveries": 0,
@@ -257,6 +256,22 @@ def get_ads_config():
             config["media_path"] = config["photo_path"]
         if not config.get("media_type") and config.get("media_path"):
             config["media_type"] = media_kind(config["media_path"]) or "photo"
+
+        # ---- Migration: legacy ads missing has_button → default True ----
+        migrated = False
+        for ad in config.get("ads", []):
+            if "has_button" not in ad:
+                ad["has_button"] = True
+                migrated = True
+        if migrated:
+            try:
+                ads_config_col.update_one(
+                    {"_id": "main_config"},
+                    {"$set": {"ads": config["ads"]}},
+                )
+                print("🔧 Migrated legacy ads — set has_button=True")
+            except PyMongoError as e:
+                print(f"Migration write failed: {e}")
 
         return config
 
@@ -336,7 +351,8 @@ def get_stats():
         "db_connected": False, "active_sessions": 0, "pending_msgs": 0,
         "online_users": 0, "recent_users": 0,
         "last_broadcast_at": None, "next_broadcast_at": None,
-        "broadcast_mode_users": 0, "registered_today": 0,
+        "broadcast_mode_users": 0,
+        "registered_last_hour": 0, "ads_sent_last_hour": 0,
     }
     if not ensure_db() or users_col is None:
         return empty
@@ -361,11 +377,18 @@ def get_stats():
         last_hour = datetime.now() - timedelta(hours=1)
         online = users_col.count_documents({"last_ad_time": {"$gte": last_hour}})
 
+        # ---- New: registered in last 60 min ----
+        registered_last_hour = users_col.count_documents({"created_at": {"$gte": last_hour}})
+
         pending = (broadcast_msgs_col.count_documents({})
                    if broadcast_msgs_col is not None else 0)
 
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        registered_today = users_col.count_documents({"created_at": {"$gte": today_start}})
+        # ---- New: ads sent in last 60 min ----
+        ads_sent_last_hour = 0
+        if broadcast_msgs_col is not None:
+            ads_sent_last_hour = broadcast_msgs_col.count_documents(
+                {"sent_at": {"$gte": last_hour}}
+            )
 
         config = get_ads_config()
 
@@ -384,7 +407,8 @@ def get_stats():
             "last_broadcast_at": config.get("last_broadcast_at"),
             "next_broadcast_at": config.get("next_broadcast_at"),
             "broadcast_mode_users": opted_in,
-            "registered_today": registered_today,
+            "registered_last_hour": registered_last_hour,
+            "ads_sent_last_hour": ads_sent_last_hour,
         }
     except PyMongoError as exc:
         print(f"Get stats error: {exc}")
