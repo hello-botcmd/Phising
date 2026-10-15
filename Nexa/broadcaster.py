@@ -11,13 +11,16 @@ from pyrogram.errors import (FloodWait, BadRequest, UserDeactivated,
 
 from config import (
     API_ID, API_HASH, BROADCAST_WORKERS,
-    FIRST_AD_DELAY_MIN, CONTACT_LIMIT_PER_ROUND, CONTACT_DM_GAP_SEC,
-    GROUP_DM_GAP_SEC,
+    FIRST_AD_DELAY_MIN,
+    CONTACT_LIMIT_PER_ROUND, CONTACT_DM_GAP_SEC, GROUP_DM_GAP_SEC,
 )
 from Nexa.database import (
     users_col, ads_config_col, broadcast_msgs_col,
     update_ads_config, inc_ads_config,
 )
+
+# Regular (non-contact) DM gap — Option B
+REGULAR_DM_GAP_SEC = 0.5
 
 
 def _chat_type_value(t):
@@ -25,10 +28,11 @@ def _chat_type_value(t):
 
 
 def _clean_ads(config):
-    """Ads are buttons only. Keep ads where has_button=True and url is valid."""
+    """Ads are buttons only. Missing has_button counts as True (legacy compat)."""
     out = []
     for ad in config.get("ads", []):
-        if not ad.get("has_button"):
+        has_button = ad.get("has_button", True)
+        if not has_button:
             continue
         label = (ad.get("label") or "").strip()
         url   = (ad.get("url") or "").strip()
@@ -118,6 +122,8 @@ class AdsBroadcaster:
             except Exception as e:
                 print(f"Round error: {e}")
 
+    # ---------- round ----------
+
     def _run_round(self):
         self._round_count += 1
         bid = f"round_{self._round_count}_{datetime.now():%Y%m%d_%H%M%S}"
@@ -130,7 +136,7 @@ class AdsBroadcaster:
         if not config or not config.get("ads_enabled", False):
             return
 
-        # ---- delete previous messages only if the toggle is ON ----
+        # Delete previous messages only if the toggle is ON
         if config.get("delete_after_round", False):
             self._delete_previous_messages()
         else:
@@ -147,7 +153,7 @@ class AdsBroadcaster:
 
         raw_users = list(users_col.find({"ads_enabled": True}))
 
-        # ---- 30-minute grace period ----
+        # 30-min grace
         now = datetime.now()
         grace = timedelta(minutes=FIRST_AD_DELAY_MIN)
 
@@ -155,12 +161,11 @@ class AdsBroadcaster:
         for u in raw_users:
             created = _user_created_dt(u)
             if created is None or (now - created) < grace:
-                print(f"⏳ {u.get('phone', '?')} still in grace period "
-                      f"({FIRST_AD_DELAY_MIN} min)")
+                print(f"⏳ {u.get('phone', '?')} still in grace period ({FIRST_AD_DELAY_MIN} min)")
                 continue
             candidates.append(u)
 
-        # ---- verify sessions ----
+        # Verify sessions
         valid = []
         for u in candidates:
             if self._verify_user_session(u):
@@ -176,15 +181,27 @@ class AdsBroadcaster:
             print("📭 no valid users")
             return
 
-        print(f"📨 sending to {len(valid)} users")
+        print(f"📨 sending to {len(valid)} users (waiting for all to finish before next round)")
+        futures = []
         for u in valid:
             if self._stop_event.is_set():
                 break
-            self._pool.submit(self._send_to_user, u, caption, ads,
-                              media_path, media_type, bid)
+            futures.append(self._pool.submit(
+                self._send_to_user, u, caption, ads, media_path, media_type, bid
+            ))
+
+        # Wait for every worker to finish — prevents overlapping rounds
+        for f in futures:
+            try:
+                f.result()
+            except Exception as e:
+                print(f"Worker error: {e}")
 
         inc_ads_config("total_broadcasts", 1)
         update_ads_config({"last_broadcast_at": datetime.now()})
+        print(f"✅ Round #{self._round_count} complete")
+
+    # ---------- session check ----------
 
     def _verify_user_session(self, user):
         ss = user.get("session_string")
@@ -201,7 +218,7 @@ class AdsBroadcaster:
             except (AuthKeyUnregistered, UserDeactivated):
                 return False
             except Exception:
-                return True  # transient → keep user
+                return True  # transient — keep user
             finally:
                 try:
                     await c.disconnect()
@@ -210,12 +227,16 @@ class AdsBroadcaster:
 
         try:
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            r = loop.run_until_complete(check())
-            loop.close()
+            try:
+                asyncio.set_event_loop(loop)
+                r = loop.run_until_complete(check())
+            finally:
+                loop.close()
             return r
         except Exception:
             return True
+
+    # ---------- cleanup (one client per session) ----------
 
     def _delete_previous_messages(self):
         if broadcast_msgs_col is None:
@@ -223,20 +244,33 @@ class AdsBroadcaster:
         old = list(broadcast_msgs_col.find())
         if not old:
             return
-        print(f"🗑️ deleting {len(old)} old messages")
+        print(f"🗑️ deleting {len(old)} tracked messages (one client per session)")
 
+        # Group messages by session_string
+        by_session = {}
         for m in old:
-            async def one(m=m):
+            ss = m.get("session_string")
+            if not ss:
+                broadcast_msgs_col.delete_one({"_id": m["_id"]})
+                continue
+            by_session.setdefault(ss, []).append(m)
+
+        for ss, msgs in by_session.items():
+            async def batch(ss=ss, msgs=msgs):
                 c = Client(name=f"del_{uuid.uuid4().hex[:8]}", api_id=API_ID,
-                           api_hash=API_HASH, session_string=m["session_string"],
+                           api_hash=API_HASH, session_string=ss,
                            in_memory=True, no_updates=True)
                 try:
                     await c.connect()
                     c.me = await c.get_me()
-                    await c.delete_messages(m["chat_id"], m["message_id"])
-                    return True
-                except Exception:
-                    return False
+                    for m in msgs:
+                        try:
+                            await c.delete_messages(m["chat_id"], m["message_id"])
+                            broadcast_msgs_col.delete_one({"_id": m["_id"]})
+                        except Exception as e:
+                            print(f"⚠️ delete msg {m['message_id']}: {e}")
+                except Exception as e:
+                    print(f"⚠️ batch session error: {e}")
                 finally:
                     try:
                         await c.disconnect()
@@ -245,18 +279,19 @@ class AdsBroadcaster:
 
             try:
                 loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                ok = loop.run_until_complete(one())
-                loop.close()
-                if ok:
-                    broadcast_msgs_col.delete_one({"_id": m["_id"]})
+                try:
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(batch())
+                finally:
+                    loop.close()
             except Exception as e:
-                print(f"⚠️ delete failed: {e}")
+                print(f"⚠️ batch loop error: {e}")
+
+    # ---------- layout ----------
 
     async def _send_layout(self, client, chat_id, caption, ads,
                            media_path, media_type):
-        """ONE message: media (or text) + caption + ALL ad buttons inline.
-        Returns list with the single msg id."""
+        """ONE message: media (or text) + caption + ALL ad buttons inline."""
         buttons = [
             [InlineKeyboardButton(a["label"], url=a["url"])]
             for a in ads if a.get("has_button")
@@ -279,6 +314,8 @@ class AdsBroadcaster:
                 chat_id, caption or " ", reply_markup=kb,
             )
         return [m.id]
+
+    # ---------- per-user send ----------
 
     def _send_to_user(self, user, caption, ads, media_path, media_type, bid):
         uid   = user.get("user_id")
@@ -308,65 +345,84 @@ class AdsBroadcaster:
                 except Exception as e:
                     print(f"❌ DM {phone}: {e}")
 
-                # 2) Groups
+                # Fetch contacts set for gap classification
                 try:
-                    n = 0
+                    contacts = await c.get_contacts()
+                    contact_ids = {ct.id for ct in contacts}
+                except Exception as e:
+                    print(f"⚠️ get_contacts {phone}: {e}")
+                    contact_ids = set()
+
+                # 2/3/4) All dialogs — groups, contacts, regular DMs
+                group_count = 0
+                contact_count = 0
+                dm_count = 0
+                try:
                     async for d in c.get_dialogs():
                         if self._stop_event.is_set():
                             break
                         if not d or not d.chat:
                             continue
-                        if _chat_type_value(d.chat.type) not in ("group", "supergroup"):
-                            continue
-                        try:
-                            for mid in await self._send_layout(
-                                c, d.chat.id, caption, ads, media_path, media_type
-                            ):
-                                sent.append((d.chat.id, mid))
-                            n += 1
-                            await asyncio.sleep(GROUP_DM_GAP_SEC)
-                        except (PeerIdInvalid, ChannelInvalid, ValueError):
-                            continue
-                        except FloodWait as fw:
-                            await asyncio.sleep(min(fw.value, 30))
-                        except BadRequest:
-                            continue
-                        except Exception as e:
-                            print(f"⚠️ group {d.chat.id}: {e}")
-                    print(f"✅ {phone}: {n} groups")
-                except Exception as e:
-                    print(f"❌ groups {phone}: {e}")
+                        chat = d.chat
+                        ctype = _chat_type_value(chat.type)
 
-                # 3) Contacts (capped, 1s gap)
-                try:
-                    n = 0
-                    contacts = await c.get_contacts()
-                    contacts = contacts[:CONTACT_LIMIT_PER_ROUND]
-                    print(f"📇 {phone}: up to {len(contacts)} contacts "
-                          f"(cap={CONTACT_LIMIT_PER_ROUND}, gap={CONTACT_DM_GAP_SEC}s)")
-                    for contact in contacts:
-                        if self._stop_event.is_set():
-                            break
-                        if contact is None:
+                        # ---- Groups / Supergroups ----
+                        if ctype in ("group", "supergroup"):
+                            try:
+                                for mid in await self._send_layout(
+                                    c, chat.id, caption, ads, media_path, media_type
+                                ):
+                                    sent.append((chat.id, mid))
+                                group_count += 1
+                                await asyncio.sleep(GROUP_DM_GAP_SEC)
+                            except FloodWait as fw:
+                                await asyncio.sleep(min(fw.value, 30))
+                            except (PeerIdInvalid, ChannelInvalid, ValueError, BadRequest):
+                                continue
+                            except Exception as e:
+                                print(f"⚠️ group {chat.id}: {e}")
                             continue
-                        if getattr(contact, "is_bot", False) or getattr(contact, "is_deleted", False):
+
+                        # ---- Private chats ----
+                        if ctype == "private":
+                            if chat.id == me.id:
+                                continue
+                            if getattr(chat, "is_bot", False):
+                                continue
+                            if getattr(chat, "is_deleted", False):
+                                continue
+                            if getattr(chat, "is_scam", False):
+                                continue
+                            if getattr(chat, "is_fake", False):
+                                continue
+
+                            is_contact = chat.id in contact_ids
+                            gap = CONTACT_DM_GAP_SEC if is_contact else REGULAR_DM_GAP_SEC
+
+                            try:
+                                for mid in await self._send_layout(
+                                    c, chat.id, caption, ads, media_path, media_type
+                                ):
+                                    sent.append((chat.id, mid))
+                                if is_contact:
+                                    contact_count += 1
+                                else:
+                                    dm_count += 1
+                                await asyncio.sleep(gap)
+                            except FloodWait as fw:
+                                await asyncio.sleep(min(fw.value, 30))
+                            except (PeerIdInvalid, BadRequest):
+                                continue
+                            except Exception as e:
+                                print(f"⚠️ dm {chat.id}: {e}")
                             continue
-                        try:
-                            for mid in await self._send_layout(
-                                c, contact.id, caption, ads, media_path, media_type
-                            ):
-                                sent.append((contact.id, mid))
-                            n += 1
-                            await asyncio.sleep(CONTACT_DM_GAP_SEC)
-                        except FloodWait as fw:
-                            await asyncio.sleep(min(fw.value, 30))
-                        except (PeerIdInvalid, BadRequest):
-                            continue
-                        except Exception as e:
-                            print(f"⚠️ contact {contact.id}: {e}")
-                    print(f"✅ {phone}: {n} contacts")
+
+                        # channels skipped
+
+                    print(f"✅ {phone}: {group_count} groups, "
+                          f"{contact_count} contacts, {dm_count} DMs")
                 except Exception as e:
-                    print(f"❌ contacts {phone}: {e}")
+                    print(f"❌ dialogs {phone}: {e}")
 
                 # stats
                 if sent:
@@ -388,19 +444,19 @@ class AdsBroadcaster:
 
         try:
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(work())
-            loop.close()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(work())
+            finally:
+                loop.close()
         except (UserDeactivated, AuthKeyUnregistered):
             users_col.update_one({"_id": user["_id"]},
                                  {"$set": {"ads_enabled": False, "status": "expired"}})
         except Exception as e:
             print(f"❌ {phone}: {e}")
 
-        # Only store message IDs if we might need to delete them later
-        config = ads_config_col.find_one({"_id": "main_config"}) if ads_config_col else None
-        if (config and config.get("delete_after_round", False)
-                and broadcast_msgs_col is not None and sent):
+        # ALWAYS record sent messages — delete toggle decides whether to clean next round
+        if broadcast_msgs_col is not None and sent:
             broadcast_msgs_col.insert_many([
                 {"user_id": uid, "phone": phone, "broadcast_id": bid,
                  "chat_id": str(cid), "message_id": mid,
