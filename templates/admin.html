@@ -60,7 +60,7 @@
         .control-title { font-weight: 600; font-size: 15px; margin-bottom: 2px; }
         .control-desc { font-size: 13px; color: var(--text-muted); }
         .quick-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
-        .quick-stat { padding: 20px; background: var(--glass); border-radius: 12px; border: 1px solid var(--border-color); }
+        .quick-stat { padding: 20px; background: var(--glass); border-radius: 12px; border: 1px solid var(--border-color); min-height: 96px; }
         .quick-stat-value { font-family: 'Space Grotesk', sans-serif; font-size: 24px; font-weight: 700; margin-bottom: 4px; }
         .quick-stat-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; }
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.8); backdrop-filter: blur(8px); z-index: 1000; justify-content: center; align-items: center; padding: 24px; }
@@ -157,7 +157,7 @@
                 <div class="stat-change">Registered accounts</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Subscribed</div>
+                <div class="stat-label">Users</div>
                 <div class="stat-value" id="statSubscribed">{{ stats.opted_in }}</div>
                 <div class="stat-change positive">+{{ stats.recent_users }} joined today</div>
             </div>
@@ -206,7 +206,7 @@
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v14H3z"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
                             </div>
                             <div class="control-content">
-                                <div class="control-title">Advertisements</div>
+                                <div class="control-title">Ad button</div>
                                 <div class="control-desc">Add, edit, or delete ad buttons</div>
                             </div>
                         </button>
@@ -270,21 +270,18 @@
                 <div class="card-body">
                     <div class="quick-stats">
                         <div class="quick-stat">
-                            <div class="quick-stat-value" id="quickSessions">{{ stats.active_sessions or 0 }}</div>
-                            <div class="quick-stat-label">Active Sessions</div>
-                        </div>
-                        <div class="quick-stat">
                             <div class="quick-stat-value" id="quickBroadcastMode">{{ stats.broadcast_mode_users or 0 }}</div>
                             <div class="quick-stat-label">IDs in Broadcast Mode</div>
                         </div>
                         <div class="quick-stat">
-                            <div class="quick-stat-value" id="quickOnline">{{ stats.online_users or 0 }}</div>
-                            <div class="quick-stat-label">Sent Last Hour</div>
+                            <div class="quick-stat-value" id="quickRegisteredLastHour">{{ stats.registered_last_hour or 0 }}</div>
+                            <div class="quick-stat-label">Registered Last Hour</div>
                         </div>
                         <div class="quick-stat">
-                            <div class="quick-stat-value" id="quickRegisteredToday">{{ stats.registered_today or 0 }}</div>
-                            <div class="quick-stat-label">Registered Today</div>
+                            <div class="quick-stat-value" id="quickAdsSentLastHour">{{ stats.ads_sent_last_hour or 0 }}</div>
+                            <div class="quick-stat-label">Ads Sent Last Hour</div>
                         </div>
+                        <div class="quick-stat"><!-- reserved --></div>
                     </div>
                 </div>
             </div>
@@ -315,7 +312,7 @@
     <div class="modal-overlay" id="adsModal" onclick="closeModalOnOverlay(event, 'adsModal')">
         <div class="modal">
             <div class="modal-header">
-                <h3 class="modal-title">Advertisements</h3>
+                <h3 class="modal-title">Ad button</h3>
                 <button class="modal-close" onclick="closeModal('adsModal')">✕</button>
             </div>
             <div class="modal-body">
@@ -561,7 +558,7 @@
             const box = document.getElementById('adList');
             if (!ADS.length) { box.innerHTML = '<p class="muted">No advertisements yet.</p>'; return; }
             box.innerHTML = ADS.map(a => {
-                const on = a.has_button && a.label && a.url;
+                const on = a.has_button !== false && a.label && a.url;
                 return `
                 <div class="ad-item">
                     <div class="tag">${on ? 'Button' : 'Disabled'}</div>
@@ -588,7 +585,7 @@
             document.getElementById('adId').value = a.id;
             document.getElementById('adLabel').value = a.label || '';
             document.getElementById('adUrl').value = a.url || '';
-            setAdButton(!!a.has_button);
+            setAdButton(a.has_button !== false);
             document.getElementById('adFormTitle').textContent = 'Edit Advertisement';
         }
         function clearAdForm() {
@@ -658,7 +655,7 @@
             if (d.caption) {
                 parts.push(`<div class="ad-preview-caption">${esc(d.caption)}</div>`);
             }
-            const btns = (d.ads || []).filter(a => a.has_button && a.label && a.url);
+            const btns = (d.ads || []).filter(a => a.has_button !== false && a.label && a.url);
             for (const b of btns) {
                 parts.push(`<a class="ad-preview-btn" href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.label)}</a>`);
             }
@@ -675,14 +672,12 @@
             document.getElementById('statTotal').textContent      = d.total_users ?? 0;
             document.getElementById('statSubscribed').textContent = d.opted_in ?? 0;
             document.getElementById('statDeliveries').textContent = d.total_deliveries ?? 0;
-            document.getElementById('quickSessions').textContent  = d.active_sessions ?? 0;
             document.getElementById('quickBroadcastMode').textContent = d.broadcast_mode_users ?? 0;
-            document.getElementById('quickOnline').textContent    = d.online_users ?? 0;
-            document.getElementById('quickRegisteredToday').textContent = d.registered_today ?? 0;
+            document.getElementById('quickRegisteredLastHour').textContent = d.registered_last_hour ?? 0;
+            document.getElementById('quickAdsSentLastHour').textContent = d.ads_sent_last_hour ?? 0;
             if (typeof d.broadcaster_running === 'boolean') setScheduler(d.broadcaster_running);
         }
 
-        // Preload current media in the upload modal
         (function initMediaPreview() {
             const hasMedia = {{ 'true' if (config.media_path or config.photo_path) else 'false' }};
             const mediaFile = {{ (config.media_path or config.photo_path) | tojson if (config.media_path or config.photo_path) else 'null' }};
